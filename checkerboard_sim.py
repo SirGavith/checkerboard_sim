@@ -18,7 +18,7 @@ class SimulationResult:
     reference: np.ndarray
     observed: np.ndarray
     displacement: np.ndarray
-    topography: np.ndarray
+    height_field: np.ndarray
     x: np.ndarray
     y: np.ndarray
 
@@ -30,6 +30,7 @@ class SimulationResult:
         """Save the simulation arrays and rendered images to disk."""
         output_dir = Path(directory)
         output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / 'observed').mkdir(parents=True, exist_ok=True)
 
         file_prefix = f"{prefix}_" if prefix else ""
         saved_paths: dict[str, str] = {}
@@ -40,7 +41,7 @@ class SimulationResult:
             reference=self.reference,
             observed=self.observed,
             displacement=self.displacement,
-            topography=self.topography,
+            topography=self.height_field,
             x=self.x,
             y=self.y,
         )
@@ -52,8 +53,8 @@ class SimulationResult:
             saved_paths[name] = str(image_path)
 
         save_image("reference", self.reference, cmap="gray", vmin=0.0, vmax=1.0)
-        save_image("observed", self.observed, cmap="gray", vmin=0.0, vmax=1.0)
-        save_image("topography", self.topography, cmap="gray")
+        save_image("observed/observed", self.observed, cmap="gray", vmin=0.0, vmax=1.0)
+        save_image("topography", self.height_field, cmap="gray")
         displacement_magnitude = np.hypot(
             self.displacement[..., 0], self.displacement[..., 1]
         )
@@ -67,16 +68,17 @@ class SimulationResult:
 
 
 def make_checkerboard(size: int = 512, squares: int = 8) -> np.ndarray:
-    """Return a square grayscale checkerboard with values 0 (black) and 1 (white)."""
+    """Return the two-wave grayscale pattern with the former checkerboard density."""
     if size < 1:
         raise ValueError("size must be positive")
     if squares < 1:
         raise ValueError("squares must be positive")
 
-    rows, columns = np.indices((size, size))
-    row_squares = rows * squares // size
-    column_squares = columns * squares // size
-    return ((row_squares + column_squares) % 2).astype(np.float32)
+    rows, columns = np.indices((size, size), dtype=np.float32)
+    wave_number = np.pi * squares / size
+    return (
+        0.5 + 0.25 * (np.cos(wave_number * columns) + np.cos(wave_number * rows))
+    ).astype(np.float32)
 
 
 def capillary_wave(
@@ -120,18 +122,22 @@ def _sample_bilinear(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndar
 
 
 def simulate_checkerboard(
-    size: int = 512,
-    squares: int = 128,
+    size: int,
+    squares: int,
+    fluid_depth: float,
+    fluid_ior: float ,
+    acrylic_thickness: float,
+    acrylic_ior: float ,
     topography: SurfaceFunction | None = None,
     wave_amplitude: float = 0.02,
     wave_wavelength: float = 0.18,
     wave_decay_length: float = 0.35,
-    optical_gain: float = 5.0,
 ) -> SimulationResult:
-    """Simulate a top-down checkerboard view distorted by a fluid surface.
+    """Simulate a periodic wave pattern viewed through a fluid surface.
 
     The first-order optical model maps the surface gradient to a pixel displacement;
-    ``optical_gain`` absorbs fluid depth, refractive-index contrast, and pixel scale.
+    the optical sensitivity is derived from the pixel scale and effective optical
+    depth. The normalized bath coordinates span one drop diameter.
     Displacements are stored as ``(u_x, u_y)`` in pixels, with x right and y down,
     following ``observed(r) = reference(r - displacement(r))``.
     Coordinates passed to ``topography`` span [-0.5, 0.5] across the bath.
@@ -154,46 +160,88 @@ def simulate_checkerboard(
     if surface.shape != (size, size):
         raise ValueError("topography function must return an array matching the canvas")
 
-    derivative_y, derivative_x = np.gradient(surface, coordinates, coordinates)
+    displac = compute_displacement(surface, coordinates,
+                                   fluid_depth, fluid_ior, acrylic_thickness, acrylic_ior)
     displacement = np.stack(
-        (-optical_gain * derivative_x, -optical_gain * derivative_y), axis=-1
+        (-displac[0], -displac[1]),
+        axis=-1,
     ).astype(np.float32)
 
     rows, columns = np.indices((size, size), dtype=np.float32)
+    reference = make_checkerboard(size=size, squares=squares)
     observed = _sample_bilinear(
-        make_checkerboard(size=size, squares=squares),
+        reference,
         columns - displacement[..., 0],
         rows - displacement[..., 1],
     )
     return SimulationResult(
-        reference=make_checkerboard(size=size, squares=squares),
+        reference=reference,
         observed=observed,
         displacement=displacement,
-        topography=surface,
+        height_field=surface,
         x=x,
         y=y,
     )
 
+def compute_displacement(surface, coordinates, fluid_depth, fluid_ior, acrylic_thickness, acrylic_ior, n_a=1.0):
+    """
+    Computes the exact non-paraxial horizontal displacement field (u_x, u_y)
+    of a bottom pattern viewed from above through a wavy fluid surface.
+    
+    Parameters:
+        surface: 2D numpy array of surface elevations eta(y, x)
+        coordinates: 1D array or scalar grid spacing
+        fluid_depth: Depth of the fluid layer
+        fluid_ior: Refractive index of the fluid
+        acrylic_thickness: Thickness of the acrylic layer
+        acrylic_ior: Refractive index of the acrylic
+        n_a: Refractive index of the ambient medium
+    Returns:
+        u_x, u_y: 2D numpy arrays of apparent horizontal displacement
+    """
+    derivative_y, derivative_x = np.gradient(surface, coordinates, coordinates)
+    
+    # Squared gradient magnitude G^2 = (d_eta/dx)^2 + (d_eta/dy)^2
+    G_sq = derivative_x**2 + derivative_y**2
+    
+    # Ratio of refractive indices
+    n_al = n_a / fluid_ior
+    n_lc = fluid_ior / acrylic_ior
+    
+    # Exact factor: (sin(theta_l) / G), well-behaved even when G == 0
+    sin_theta_l_over_G = (
+        np.sqrt(1.0 + (1.0 - n_al**2) * G_sq) - n_al
+    ) / (1.0 + G_sq)
+    
+    # sin^2(theta_l) and sin^2(theta_c)
+    sin_sq_theta_l = (sin_theta_l_over_G**2) * G_sq
+    sin_sq_theta_c = (n_lc**2) * sin_sq_theta_l
+    
+    # Local fluid depth (constant h_l, or h_l + eta if finite amplitude is included)
+    h_l = (fluid_depth + surface)
+    
+    # Effective non-paraxial depth factor h*_exact(x, y)
+    h_star_exact = sin_theta_l_over_G * (
+        h_l / np.sqrt(1.0 - sin_sq_theta_l)
+        + (n_lc * acrylic_thickness) / np.sqrt(1.0 - sin_sq_theta_c)
+    )
+
+    # print(f"Max h_star_exact: {np.max(h_star_exact)}, Min h_star_exact: {np.min(h_star_exact)}")
+    # print(f"Average h_star_exact: {np.mean(h_star_exact)}")
+
+    u_x = h_star_exact * derivative_x
+    u_y = h_star_exact * derivative_y
+    
+    return u_x, u_y
 
 def render_simulation(result: SimulationResult) -> tuple[Figure, np.ndarray]:
-    """Render the reference, distorted image, and displacement magnitude."""
-    displacement_magnitude = np.hypot(
-        result.displacement[..., 0], result.displacement[..., 1]
-    )
-    figure, axes = plt.subplots(1, 3, figsize=(13, 4), constrained_layout=True)
+    """Render the reference and distorted image."""
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 4), constrained_layout=True)
     axes[0].imshow(result.reference, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-    axes[0].set_title("Reference checkerboard")
+    axes[0].set_title("Reference pattern")
     axes[1].imshow(result.observed, cmap="gray", vmin=0, vmax=1, interpolation="bilinear")
     axes[1].set_title("Simulated camera image")
-    image = axes[2].imshow(displacement_magnitude, cmap="magma", origin="upper")
-    axes[2].set_title("Displacement magnitude (pixels)")
-    figure.colorbar(image, ax=axes[2], shrink=0.8)
     for axis in axes:
         axis.set_axis_off()
     return figure, axes
-
-if __name__ == "__main__":
-    simulation = simulate_checkerboard()
-    render_simulation(simulation)
-    simulation.save_simulation('.out/test1')
-    plt.show()
